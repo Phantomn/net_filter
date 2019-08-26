@@ -4,12 +4,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-struct ethernet{
-    uint8_t descMac[6];
-    uint8_t srcMac[6];
-    uint16_t ethType;
-};
-
 struct ip{
     uint8_t version;
     uint8_t hdrLen;
