@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <netinet/in.h>
@@ -6,13 +7,8 @@
 #include <linux/netfilter.h>		/* for NF_ACCEPT */
 #include <errno.h>
 #include "struct.h"
-
 #include <libnetfilter_queue/libnetfilter_queue.h>
-
-struct ethernet eth;
-struct ip ip;
-struct tcp tcp;
-struct http http;
+static char* url;
 void dump(unsigned char* buf, int size) {
     int i;
     for (i = 0; i < size; i++) {
@@ -21,22 +17,61 @@ void dump(unsigned char* buf, int size) {
         printf("%02x ", buf[i]);
     }
 }
+struct ip ip;
+struct tcp tcp;
+void ip_print(const u_char* ptr){
+    u_char val_v_len = *ptr;
+    ip.version = (val_v_len & 0xF0)>>4;
+    ip.hdrLen = (val_v_len & 0x0F)*4;
+    uint8_t val_dscp = *(ptr=ptr+1);
+    uint8_t DSCP[2];
+    DSCP[0] = (val_dscp & 0xFC);
+    DSCP[1] = (val_dscp & 0x3);
+    ip.totLen = *(ptr=ptr+1) << 8 | *(ptr=ptr+1);
+    ip.ID = *(ptr=ptr+1) << 8 | *(ptr=ptr+1);
+    ip.flags = *(ptr=ptr+1) << 8 | *(ptr=ptr+1);
+    ip.ttl = *(ptr=ptr+1);
+    ip.protocol = *(ptr=ptr+1);
+    ip.chksum = *(ptr=ptr+1) << 8 | *(ptr=ptr+1);
+    memcpy(ip.srcIp, ptr=ptr+1, 4);
+    memcpy(ip.destIp, ptr=ptr+4, 4);
 
+
+    if(ip.version == 4)
+        printf("\nVersion : IPv4\n");
+    if(ip.protocol == 0x06){
+        printf("Protocol : TCP\n");
+        printf("Header Length : %d\n",ip.hdrLen);
+        printf("Total Length : %d\n",ip.totLen);
+    }
+}
+void tcp_print(const u_char* ptr){
+    tcp.srcPort = *(ptr) << 8 | *(ptr=ptr+1);
+    tcp.destPort = *(ptr=ptr+1) << 8 | *(ptr=ptr+1);
+    if(tcp.destPort == 80){
+        printf("Source Port : %d\n", tcp.srcPort);
+        printf("Destination Port : %d\n", tcp.destPort);
+        tcp.hdrLen = (*(ptr=ptr+9) >> 4)*4;
+        printf("Header Length : %d\n",tcp.hdrLen);
+    }
+}
 /* returns packet id */
-static u_int32_t print_pkt (struct nfq_data *tb)
+static u_int32_t print_pkt (struct nfq_q_handle* qh, struct nfq_data *tb)
 {
     int id = 0;
     struct nfqnl_msg_packet_hdr *ph;
     struct nfqnl_msg_packet_hw *hwph;
     u_int32_t mark,ifi;
     int ret;
+    int res;
     unsigned char *data;
+
 
     ph = nfq_get_msg_packet_hdr(tb);
     if (ph) {
         id = ntohl(ph->packet_id);
         printf("hw_protocol=0x%04x hook=%u id=%u ",
-            ntohs(ph->hw_protocol), ph->hook, id);
+               ntohs(ph->hw_protocol), ph->hook, id);
     }
 
     hwph = nfq_get_packet_hw(tb);
@@ -73,40 +108,37 @@ static u_int32_t print_pkt (struct nfq_data *tb)
     if (ret >= 0)
         printf("payload_len=%d ", ret);
     if(ret > 0){
-        struct ip* ip =(struct ip*) data;
-        if(ip->version == 4)
-            printf("Version : IPv4\n");
-        if(ip->protocol == 0x06){
-            printf("Protocol : TCP\n");
-            printf("Header Length : %d\n",ip->hdrLen * 4);
-            printf("Total Length : %d\n",ip->totLen);
-            printf("Source IP : %d.%d.%d.%d\n",ip->srcIp[0],ip->srcIp[1],ip->srcIp[2],ip->srcIp[3]);
-            printf("Destination IP : %d.%d.%d.%d\n",ip->destIp[0],ip->destIp[1],ip->destIp[2],ip->destIp[3]);
+        ip_print(data);
+        tcp_print(&data[ip.hdrLen]);
+        if(ip.version == 0x4){
+            if(tcp.destPort == 80){
+                if(ret > (ip.hdrLen + tcp.hdrLen)){
+                    int offset = ip.hdrLen + tcp.hdrLen;
+                    unsigned char * payload = &data[offset+22];
+                    printf("=======HTTP Payload=======\n%s\n%s\n",payload,url);
+                    if(!strncmp(reinterpret_cast<const char*>(payload), reinterpret_cast<const char*>(url),strlen(url))){
+                        res = nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+                        fprintf(stdout, "This Domain is Blocked\n");
+                    }
+                }
+            }
         }
-        struct tcp* tcp = (struct tcp*)data[ip->hdrLen];
-        if(tcp->srcPort == 80){
-            printf("Source Prt : %d\n", tcp->srcPort);
-            printf("Destination Port : %d\n", tcp->destPort);
-            printf("Header Length : %d\n",tcp->hdrLen * 4);
-        }else if(tcp->destPort == 443){
-            printf("Source Port : %d\n", tcp->srcPort);
-            printf("Destination Port : %d\n",tcp->destPort);
-            printf("Header Length : %d\n",tcp->hdrLen);
-        }
+
     }
 
     fputc('\n', stdout);
+    res = nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 
-    return id;
+    return res;
 }
 
 
 static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
-          struct nfq_data *nfa, void *data)
+              struct nfq_data *nfa, void *data)
 {
-    u_int32_t id = print_pkt(nfa);
+    u_int32_t id = print_pkt(qh, nfa);
     printf("entering callback\n");
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+    return id;
 }
 
 int main(int argc, char **argv)
@@ -117,6 +149,7 @@ int main(int argc, char **argv)
     int fd;
     int rv;
     char buf[4096] __attribute__ ((aligned));
+    url = argv[1];
 
     printf("opening library handle\n");
     h = nfq_open();
